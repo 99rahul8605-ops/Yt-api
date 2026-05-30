@@ -1,4 +1,4 @@
 flask
-yt-dlp
 requests
 gunicorn
+yt-dlp[default]
