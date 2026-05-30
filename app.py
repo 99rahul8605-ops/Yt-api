@@ -45,7 +45,7 @@ def get_ydl_opts():
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "140/251/250/249/171/bestaudio/best",
+        "format": None,
     }
     if os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
