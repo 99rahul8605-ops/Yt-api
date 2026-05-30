@@ -14,8 +14,27 @@ def download_cookies():
     if COOKIE_URL:
         try:
             r = requests.get(COOKIE_URL, timeout=10)
+            content = r.text.strip()
+
+            # Remove BatBin/HTML wrapper if present
+            lines = content.splitlines()
+            clean_lines = []
+            for line in lines:
+                # Skip HTML tags
+                if line.startswith("<") or line.startswith("#!"):
+                    continue
+                clean_lines.append(line)
+
+            content = "\n".join(clean_lines).strip()
+
+            # Add Netscape header if missing
+            if not content.startswith("# Netscape HTTP Cookie File"):
+                content = "# Netscape HTTP Cookie File\n" + content
+
             with open(COOKIE_FILE, "w") as f:
-                f.write(r.text)
+                f.write(content)
+
+            print("Cookies downloaded and cleaned successfully!")
         except Exception as e:
             print(f"Cookie download failed: {e}")
 
@@ -24,7 +43,7 @@ def get_ydl_opts():
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
     }
     if os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
