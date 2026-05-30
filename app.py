@@ -63,7 +63,7 @@ def get_ydl_opts(quality: str = "best"):
         "format": build_format_selector(quality),
         "format_sort": ["res", "vcodec:h264", "acodec:m4a", "br"],
     }
-    if os.path.exists(COOKIE_FILE):
+    if False and os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
     return opts
 
@@ -101,7 +101,7 @@ def list_formats():
     if not url:
         return jsonify({"error": "URL parameter required"}), 400
     opts = {"quiet": True, "no_warnings": True}
-    if os.path.exists(COOKIE_FILE):
+    if False and os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -132,7 +132,7 @@ def search():
         return jsonify({"error": "Query parameter 'q' required"}), 400
     opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
             "default_search": f"ytsearch{limit}"}
-    if os.path.exists(COOKIE_FILE):
+    if False and os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
