@@ -11,7 +11,6 @@ COOKIE_URL = os.getenv("COOKIE_URL", "")
 COOKIE_FILE = "/tmp/cookies.txt"
 API_KEY = os.getenv("API_KEY", "")
 
-# Version info on startup
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 try:
     deno_ver = subprocess.check_output(["deno", "--version"], text=True).splitlines()[0]
@@ -41,11 +40,28 @@ def download_cookies():
             print(f"Cookie download failed: {e}")
 
 
-def get_ydl_opts():
+def build_format_selector(quality: str) -> str:
+    """Build yt-dlp format selector — same logic as downloader.py"""
+    if quality == "best":
+        return "bestvideo+bestaudio/best"
+    target_h = {
+        "360p": 360, "480p": 480, "720p": 720,
+        "1080p": 1080, "1440p": 1440, "2160p": 2160, "4k": 2160
+    }.get(quality, 1080)
+    return (
+        f"bestvideo[height<={target_h}]+bestaudio"
+        f"/best[height<={target_h}]"
+        f"/bestvideo+bestaudio"
+        f"/best"
+    )
+
+
+def get_ydl_opts(quality: str = "best"):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": None,
+        "format": build_format_selector(quality),
+        "format_sort": ["res", "vcodec:h264", "acodec:m4a", "br"],
     }
     if os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
@@ -76,6 +92,36 @@ def index():
     })
 
 
+@app.route("/formats")
+def list_formats():
+    """List all available formats for a video"""
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "URL parameter required"}), 400
+    opts = {"quiet": True, "no_warnings": True}
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = []
+            for f in info.get("formats", []):
+                formats.append({
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "acodec": f.get("acodec"),
+                    "vcodec": f.get("vcodec"),
+                    "height": f.get("height"),
+                    "abr": f.get("abr"),
+                    "format_note": f.get("format_note"),
+                })
+            return jsonify({"title": info.get("title"), "formats": formats})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/search")
 def search():
     if not check_auth():
@@ -84,9 +130,10 @@ def search():
     limit = int(request.args.get("limit", 5))
     if not query:
         return jsonify({"error": "Query parameter 'q' required"}), 400
-    opts = get_ydl_opts()
-    opts["extract_flat"] = True
-    opts["default_search"] = f"ytsearch{limit}"
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
+            "default_search": f"ytsearch{limit}"}
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             results = ydl.extract_info(query, download=False)
@@ -112,9 +159,10 @@ def get_link():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
     url = request.args.get("url")
+    quality = request.args.get("quality", "best")
     if not url:
         return jsonify({"error": "URL parameter required"}), 400
-    opts = get_ydl_opts()
+    opts = get_ydl_opts(quality)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -124,6 +172,8 @@ def get_link():
                 "thumbnail": info.get("thumbnail"),
                 "stream_url": info.get("url"),
                 "channel": info.get("channel") or info.get("uploader"),
+                "format": info.get("format"),
+                "height": info.get("height"),
             })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
