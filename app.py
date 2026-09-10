@@ -1,187 +1,3 @@
-app.py
-Python
-isme dekho downlod ka code hoga
-
-Ab ek important cheez mili: tumhara Python test actually run hi nahi hua. docker exec me -i missing tha, isliye heredoc container ke Python tak gaya hi nahi.
-
-Ye exact command chalao:
-
-docker exec -i yt-fast-api python - <<'PY'
-import yt_dlp
-
-opts = {
-    "verbose": True,
-    "skip_download": True,
-    "format": "bestaudio/best",
-    "cookiefile": "/app/cookies.txt",
-    "js_runtimes": {"deno": {}},
-    "remote_components": {"ejs:npm"},
-}
-
-with yt_dlp.YoutubeDL(opts) as ydl:
-    info = ydl.extract_info(
-        "https://www.youtube.com/watch?v=DS-raAyMxl4",
-        download=False
-    )
-    print("\nSUCCESS")
-    print(info.get("url"))
-PY
-
-Ab output zaroor aayega.
-
-CLI already work kar raha hai:
-
-[jsc:deno] Solving JS challenges using deno
-[info] ... format(s): 251
-
-Isliye ye Python test decisive hoga:
-
-SUCCESS + googlevideo URL aaye → API ke app.py me koi aur difference hai.
-Sign in to confirm... aaye → Python yt-dlp options CLI ke equivalent nahi ja rahe.
-
-Jo output aaye woh bhejo. Ab exact root cause isolate ho jayega.
-
-song success hogya
-
-Good — iska matlab Python API-style yt-dlp extraction bhi work kar raha hai. So Deno, EJS, cookies, and Python YoutubeDL options sab sahi hain.
-
-Ab remaining issue almost certainly running /song endpoint ke actual code path me hai — ya old options use ho rahe hain, ya /song me extra/fallback logic different hai.
-
-Ab ek simple test karo browser me wahi /song URL dubara:
-
-http://35.180.73.26:8010/song/DS-raAyMxl4?api_key=6f42736a5ee67b7e57f9845f277bf8fb6b228b0180f70a2a99cdb1e111336510
-
-Agar ab bhi fail hota hai, mujhe current /song function ka container wala exact code bhejo:
-
-docker exec yt-fast-api sed -n '85,130p' /app/app.py
-
-Usko Python-success test ke exact equivalent bana denge.
-
-"message":"ERROR: [youtube] DS-raAyMxl4: Sign in to confirm you\u2019re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies","status":"error"}
-Analyzed
-from pathlib import Path
-
-src = Path("/mnt/data/app.py")
-text = src.read_text(encoding="utf-8")
-
-text = text.replace(
-    'COOKIE_FILE = "/tmp/cookies.txt"',
-    'COOKIE_FILE = os.getenv("COOKIE_FILE", "/app/cookies.txt")'
-)
-
-text = text.replace(
-    'opts = {"quiet": True, "no_warnings": True}',
-    '''opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "js_runtimes": {"deno": {}},
-        "remote_components": {"ejs:npm"},
-    }'''
-)
-
-out = Path("/mnt/data/app-final-fixed.py")
-out.write_text(text, encoding="utf-8")
-print(out)
-
-STDOUT/STDERR
-/mnt/data/app-final-fixed.py
-
-
-Root cause mil gaya. Tumhare API code me cookie path hardcoded tha:
-
-COOKIE_FILE = "/tmp/cookies.txt"
-
-Lekin Docker me actual working cookies yahan mounted hain:
-
-/app/cookies.txt
-
-CLI isi /app/cookies.txt ko use karke successful hua, isliye browser API fail kar rahi thi. Original file me hardcoded /tmp/cookies.txt hi tha.
-
-Maine final file me:
-
-cookie path /app/cookies.txt env-aware kar diya
-Deno JS runtime add kiya
-ejs:npm add kiya
-
-Download final fixed app.py
-
-AWS par isko app.py naam se replace karo, phir:
-
-docker compose down
-docker compose up -d --build
-
-Phir browser test:
-
-http://35.180.73.26:8010/song/DS-raAyMxl4?api_key=6f42736a5ee67b7e57f9845f277bf8fb6b228b0180f70a2a99cdb1e111336510
-
-Ab API aur successful CLI dono same cookie file use karenge. 
-
-app-final-fixed.py
-Code
-
-Library
-/
-app-final-fixed.py
-999
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-11
-12
-13
-14
-15
-16
-17
-18
-19
-20
-21
-22
-23
-24
-25
-26
-27
-28
-29
-30
-31
-32
-33
-34
-35
-36
-37
-38
-39
-40
-41
-42
-43
-44
-45
-46
-47
-48
-49
-50
-51
-52
-53
-54
-55
-56
-57
-58
-59
 import os
 import time
 import subprocess
@@ -190,18 +6,14 @@ import yt_dlp
 import yt_dlp.version
 from flask import Flask, jsonify, request
 
-
 app = Flask(__name__)
-
 
 COOKIE_URL = os.getenv("COOKIE_URL", "")
 COOKIE_FILE = os.getenv("COOKIE_FILE", "/app/cookies.txt")
 API_KEY = os.getenv("API_KEY", "")
 CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))
 
-
 cache = {}
-
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 try:
@@ -209,8 +21,6 @@ try:
     print(f"Deno version: {deno_ver}")
 except Exception as e:
     print(f"Deno not found: {e}")
-
-
 
 
 def get_cache(key):
@@ -222,12 +32,8 @@ def get_cache(key):
     return None
 
 
-
-
 def set_cache(key, data):
     cache[key] = (data, time.time())
-
-
 
 
 def download_cookies():
@@ -246,10 +52,178 @@ def download_cookies():
             print(f"Cookie download failed: {e}")
 
 
-
-
 def get_base_opts():
     opts = {
         "quiet": True,
         "no_warnings": True,
         "js_runtimes": {"deno": {}},
+        "remote_components": {"ejs:npm"},
+    }
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+    return opts
+
+
+def check_auth():
+    if not API_KEY:
+        return True
+    key = request.headers.get("X-API-Key") or request.args.get("api_key") or request.args.get("api")
+    return key == API_KEY
+
+
+download_cookies()
+
+
+@app.route("/")
+def index():
+    try:
+        deno_ver = subprocess.check_output(["deno", "--version"], text=True).splitlines()[0]
+    except:
+        deno_ver = "not found"
+    return jsonify({
+        "status": "running",
+        "message": "YouTube API is live!",
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "deno_version": deno_ver,
+        "cache_size": len(cache),
+    })
+
+
+# === AnnieXMusic compatible endpoints ===
+
+@app.route("/song/<video_id>")
+def song(video_id):
+    """Audio endpoint - AnnieXMusic format"""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    cache_key = f"song:{video_id}"
+    cached = get_cache(cache_key)
+    if cached:
+        return jsonify({**cached, "cached": True})
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = get_base_opts()
+    opts["format"] = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get("url")
+            if not stream_url and info.get("requested_formats"):
+                for f in info["requested_formats"]:
+                    if f.get("acodec") != "none":
+                        stream_url = f.get("url")
+                        break
+            ext = info.get("ext", "m4a")
+            data = {
+                "status": "done",
+                "link": stream_url,
+                "format": ext,
+                "title": info.get("title"),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "channel": info.get("channel") or info.get("uploader"),
+            }
+            set_cache(cache_key, data)
+            return jsonify(data)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/video/<video_id>")
+def video(video_id):
+    """Video endpoint - AnnieXMusic format"""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    cache_key = f"video:{video_id}"
+    cached = get_cache(cache_key)
+    if cached:
+        return jsonify({**cached, "cached": True})
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = get_base_opts()
+    opts["format"] = "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720]/best"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get("url")
+            if not stream_url and info.get("requested_formats"):
+                for f in info["requested_formats"]:
+                    if f.get("vcodec") != "none":
+                        stream_url = f.get("url")
+                        break
+            ext = info.get("ext", "mp4")
+            data = {
+                "status": "done",
+                "link": stream_url,
+                "format": ext,
+                "title": info.get("title"),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+            }
+            set_cache(cache_key, data)
+            return jsonify(data)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# === Extra endpoints ===
+
+@app.route("/search")
+def search():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    query = request.args.get("q")
+    limit = int(request.args.get("limit", 5))
+    if not query:
+        return jsonify({"error": "Query parameter 'q' required"}), 400
+
+    cache_key = f"search:{query}:{limit}"
+    cached = get_cache(cache_key)
+    if cached:
+        return jsonify({"results": cached, "cached": True})
+
+    opts = get_base_opts()
+    opts["extract_flat"] = True
+    opts["default_search"] = f"ytsearch{limit}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            results = ydl.extract_info(query, download=False)
+            data = []
+            for e in results.get("entries", []):
+                data.append({
+                    "id": e.get("id"),
+                    "title": e.get("title"),
+                    "duration": e.get("duration"),
+                    "url": f"https://youtube.com/watch?v={e.get('id')}",
+                    "thumbnail": e.get("thumbnail"),
+                    "channel": e.get("channel") or e.get("uploader"),
+                    "views": e.get("view_count"),
+                })
+            set_cache(cache_key, data)
+            return jsonify({"results": data, "cached": False})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/reload_cookies")
+def reload_cookies():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    download_cookies()
+    return jsonify({"status": "Cookies reloaded!"})
+
+
+@app.route("/clear_cache")
+def clear_cache():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    cache.clear()
+    return jsonify({"status": "Cache cleared!"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
