@@ -1,31 +1,56 @@
-# Fast yt-dlp API
+# Yt-api fast fixed
 
-Install:
+This version is optimized for fast search + fresh audio URL extraction.
+
+## Start
+
 ```bash
-pip install -r requirements.txt
+cp env.example .env
+docker compose up -d --build
 ```
 
-Run:
+Put a fresh Netscape-format `cookies.txt` beside `docker-compose.yml`.
+
+## Health
+
 ```bash
-export API_KEY='your-secret-key'
-uvicorn api:app --host 0.0.0.0 --port 8000
+curl http://127.0.0.1:8010/health
 ```
 
-Health:
+## Search
+
 ```bash
-curl http://127.0.0.1:8000/health
+curl --get \
+  --data-urlencode "q=arijit singh" \
+  --data-urlencode "limit=5" \
+  -H "X-API-Key: YOUR_KEY" \
+  http://127.0.0.1:8010/search
 ```
 
-Search:
+The JSON includes `elapsed` seconds.
+
+## Song/audio URL
+
 ```bash
-curl --get --data-urlencode "q=arijit singh" --data-urlencode "limit=5" \
--H "X-API-Key: your-secret-key" http://127.0.0.1:8000/search
+curl \
+  -H "X-API-Key: YOUR_KEY" \
+  http://127.0.0.1:8010/song/VIDEO_ID
 ```
 
-Extract:
-```bash
-curl --get --data-urlencode "url=https://www.youtube.com/watch?v=VIDEO_ID" \
--H "X-API-Key: your-secret-key" http://127.0.0.1:8000/extract
+Response contains `link`, which is the extracted audio media URL.
+
+## Browser testing
+
+This version also accepts `api_key=` in the query string:
+
+```
+http://SERVER_IP:8010/search?q=arijit%20singh&limit=5&api_key=YOUR_KEY
 ```
 
-The API creates long-lived yt-dlp objects once at startup. Search uses extract_flat=True and a short in-memory cache, so repeated searches can return almost instantly. Full extraction happens only when /extract is called.
+and:
+
+```
+http://SERVER_IP:8010/song/VIDEO_ID?api_key=YOUR_KEY
+```
+
+Do not publish URLs containing your real API key.
