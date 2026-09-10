@@ -1,0 +1,14 @@
+services:
+  yt-fast-api:
+    build: .
+    container_name: yt-fast-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      API_KEY: ${API_KEY}
+      COOKIE_FILE: /app/cookies.txt
+      SEARCH_TTL: ${SEARCH_TTL:-300}
+      EXTRACT_TTL: ${EXTRACT_TTL:-600}
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro

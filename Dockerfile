@@ -1,25 +1,21 @@
-FROM python:3.10-slim
-
-ENV DEBIAN_FRONTEND=noninteractive
+FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
-    unzip \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Deno
-RUN curl -fsSL https://deno.land/install.sh | sh
-ENV DENO_INSTALL="/root/.deno"
-ENV PATH="$DENO_INSTALL/bin:$PATH"
-
 COPY requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
-RUN pip install -U yt-dlp
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . /app
+COPY . .
 
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "app:app"]
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
