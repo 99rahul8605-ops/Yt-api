@@ -1,38 +1,57 @@
 # Fast yt-dlp API — AWS Docker setup
 
-## 1. Files
-Put your Netscape-format `cookies.txt` in this folder.
+This build includes:
+- Python 3.12
+- yt-dlp
+- ffmpeg
+- Deno JavaScript runtime
+- FastAPI
+- Docker Compose
+- host port 8010 -> container port 8000
+- cookies mounted at `/app/cookies.txt`
 
-## 2. Configure
-Copy `.env.example` to `.env`:
+## Setup
 
 ```bash
-cp .env.example .env
+cp env.example .env
 ```
 
-Edit the API key in `.env`.
+Edit `.env` and set a strong `API_KEY`.
 
-## 3. Build and start
+Place a fresh Netscape-format `cookies.txt` in this folder.
+
+Build and run:
+
 ```bash
 docker compose up -d --build
 ```
 
-## 4. Check
+Check:
+
 ```bash
 docker compose ps
-docker compose logs -f
-curl http://127.0.0.1:8000/health
+docker exec yt-fast-api deno --version
+curl http://127.0.0.1:8010/health
 ```
 
-## 5. Search test
+Search test:
+
 ```bash
-curl --get   --data-urlencode "q=arijit singh"   --data-urlencode "limit=5"   -H "X-API-Key: YOUR_API_KEY"   http://127.0.0.1:8000/search
+curl --get \
+  --data-urlencode "q=arijit singh" \
+  --data-urlencode "limit=5" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  http://127.0.0.1:8010/search
 ```
 
-## 6. Extract test
+Best-audio extraction test:
+
 ```bash
-curl --get   --data-urlencode "url=https://www.youtube.com/watch?v=VIDEO_ID"   -H "X-API-Key: YOUR_API_KEY"   http://127.0.0.1:8000/extract
+docker exec yt-fast-api yt-dlp \
+  -f "bestaudio/best" \
+  --cookies /app/cookies.txt \
+  --skip-download \
+  "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-## AWS note
-Do not expose port 8000 to `0.0.0.0/0` unless necessary. Prefer allowing only your bot server IP in the EC2 Security Group, or put the API behind a reverse proxy/HTTPS.
+Do not commit `.env` or `cookies.txt` to GitHub.
