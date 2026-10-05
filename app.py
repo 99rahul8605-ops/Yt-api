@@ -4,7 +4,7 @@ import subprocess
 import requests
 import yt_dlp
 import yt_dlp.version
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, stream_with_context
 
 app = Flask(__name__)
 
@@ -113,6 +113,7 @@ def index():
         "yt_dlp_version": yt_dlp.version.__version__,
         "deno_version": deno_ver,
         "cache_size": len(cache),
+        "audio_proxy": True,
         "cache_ttl": {
             "song": SONG_CACHE_TTL,
             "search": SEARCH_CACHE_TTL,
@@ -121,26 +122,24 @@ def index():
     })
 
 
-# === AnnieXMusic compatible endpoints ===
+def _extract_audio_data(video_id, force_fresh=False):
+    """
+    Extract one playable audio URL.
 
-@app.route("/song/<video_id>")
-def song(video_id):
-    """Audio endpoint - AnnieXMusic format"""
-    if not check_auth():
-        return jsonify({"status": "error", "message": "Unauthorized"}), 401
-
+    This helper is shared by /song and /audio. Keeping extraction on the API
+    host avoids giving the bot VPS a raw googlevideo URL that may be tied to
+    the API host/session/IP.
+    """
     cache_key = f"song:{video_id}"
-    if wants_fresh():
+
+    if force_fresh:
         cache.pop(cache_key, None)
     else:
         cached = get_cache(cache_key)
         if cached:
-            return jsonify({**cached, "cached": True})
+            return cached
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # Try several increasingly broad selectors. Some YouTube videos do not expose
-    # an m4a/webm audio-only format to the client yt-dlp selected.
     format_candidates = [
         "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
         "bestaudio/best",
@@ -158,56 +157,183 @@ def song(video_id):
                 info = ydl.extract_info(url, download=False)
 
             stream_url = info.get("url")
+            chosen = info
 
             if not stream_url and info.get("requested_formats"):
-                for f in info["requested_formats"]:
-                    if f.get("acodec") != "none" and f.get("url"):
-                        stream_url = f.get("url")
+                for fmt in info["requested_formats"]:
+                    if fmt.get("acodec") != "none" and fmt.get("url"):
+                        stream_url = fmt.get("url")
+                        chosen = {**info, **fmt}
                         break
 
             if not stream_url and info.get("formats"):
-                # Last-resort selection from the formats yt-dlp returned.
                 audio_formats = [
-                    f for f in info["formats"]
-                    if f.get("url") and f.get("acodec") not in (None, "none")
+                    fmt
+                    for fmt in info["formats"]
+                    if fmt.get("url")
+                    and fmt.get("acodec") not in (None, "none")
                 ]
                 if audio_formats:
                     audio_formats.sort(
-                        key=lambda f: (
-                            f.get("abr") or 0,
-                            f.get("tbr") or 0,
+                        key=lambda fmt: (
+                            fmt.get("abr") or 0,
+                            fmt.get("tbr") or 0,
                         ),
                         reverse=True,
                     )
+                    chosen = {**info, **audio_formats[0]}
                     stream_url = audio_formats[0].get("url")
-                    info = {**info, **audio_formats[0]}
 
             if not stream_url:
                 raise RuntimeError("No playable audio URL found")
 
-            ext = info.get("ext") or "webm"
             data = {
                 "status": "done",
                 "link": stream_url,
-                "format": ext,
+                "format": chosen.get("ext") or info.get("ext") or "webm",
                 "title": info.get("title"),
                 "duration": info.get("duration"),
                 "thumbnail": info.get("thumbnail"),
                 "channel": info.get("channel") or info.get("uploader"),
                 "selector": selector,
+                # yt-dlp sometimes returns headers that are useful when
+                # requesting the signed media URL.
+                "http_headers": info.get("http_headers") or {},
                 "cached": False,
             }
             set_cache(cache_key, data)
-            return jsonify(data)
+            return data
 
-        except Exception as e:
-            last_error = e
-            continue
+        except Exception as exc:
+            last_error = exc
 
-    return jsonify({
-        "status": "error",
-        "message": str(last_error) if last_error else "Audio extraction failed",
-    }), 500
+    raise RuntimeError(
+        str(last_error) if last_error else "Audio extraction failed"
+    )
+
+
+def _open_audio_upstream(video_id, range_header=None, force_fresh=False):
+    data = _extract_audio_data(video_id, force_fresh=force_fresh)
+    stream_url = data["link"]
+
+    headers = {
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+    }
+
+    for key, value in (data.get("http_headers") or {}).items():
+        if key and value:
+            headers[str(key)] = str(value)
+
+    if range_header:
+        headers["Range"] = range_header
+
+    upstream = requests.get(
+        stream_url,
+        headers=headers,
+        stream=True,
+        allow_redirects=True,
+        timeout=(10, 35),
+    )
+    return upstream, data
+
+# === AnnieXMusic compatible endpoints ===
+
+@app.route("/song/<video_id>")
+def song(video_id):
+    """Return extracted audio metadata / signed URL."""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    try:
+        data = _extract_audio_data(video_id, force_fresh=wants_fresh())
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
+
+@app.route("/audio/<video_id>", methods=["GET", "HEAD"])
+def audio_proxy(video_id):
+    """
+    Stable streaming proxy for voice-chat playback.
+
+    FFmpeg/PyTgCalls connects to this API URL instead of directly to the
+    googlevideo signed URL. Range requests are forwarded. If YouTube rejects
+    a cached signed URL with 403, the API re-extracts once and retries.
+    """
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    range_header = request.headers.get("Range")
+
+    try:
+        upstream, data = _open_audio_upstream(
+            video_id,
+            range_header=range_header,
+            force_fresh=wants_fresh(),
+        )
+
+        # A cached signed URL can occasionally expire/become invalid.
+        # Refresh it once on the API host and retry there.
+        if upstream.status_code == 403:
+            upstream.close()
+            cache.pop(f"song:{video_id}", None)
+            upstream, data = _open_audio_upstream(
+                video_id,
+                range_header=range_header,
+                force_fresh=True,
+            )
+
+        if upstream.status_code not in (200, 206):
+            status = upstream.status_code
+            upstream.close()
+            return jsonify({
+                "status": "error",
+                "message": f"Upstream media returned {status}",
+            }), status
+
+        response_headers = {
+            "Content-Type": upstream.headers.get(
+                "Content-Type",
+                "audio/mp4" if data.get("format") == "m4a" else "audio/webm",
+            ),
+            "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+            "Cache-Control": "no-store",
+        }
+
+        for header_name in ("Content-Length", "Content-Range"):
+            value = upstream.headers.get(header_name)
+            if value:
+                response_headers[header_name] = value
+
+        if request.method == "HEAD":
+            status = upstream.status_code
+            upstream.close()
+            return Response(status=status, headers=response_headers)
+
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_with_context(generate()),
+            status=upstream.status_code,
+            headers=response_headers,
+            direct_passthrough=True,
+        )
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
 
 
 @app.route("/video/<video_id>")
@@ -258,40 +384,76 @@ def video(video_id):
 def search():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-    query = request.args.get("q")
-    limit = int(request.args.get("limit", 5))
+
+    query = (request.args.get("q") or "").strip()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 5)), 20))
+    except Exception:
+        limit = 5
+
     if not query:
         return jsonify({"error": "Query parameter 'q' required"}), 400
 
-    cache_key = f"search:{query}:{limit}"
+    # Normalize whitespace so equivalent searches share one cache entry.
+    normalized_query = " ".join(query.split())
+    cache_key = f"search:{normalized_query.lower()}:{limit}"
+
     if wants_fresh():
         cache.pop(cache_key, None)
     else:
         cached = get_cache(cache_key)
         if cached:
-            return jsonify({"results": cached, "cached": True})
+            return jsonify({
+                "results": cached,
+                "cached": True,
+            })
 
     opts = get_base_opts()
     opts["extract_flat"] = True
-    opts["default_search"] = f"ytsearch{limit}"
+
     try:
+        # Explicit ytsearch is more deterministic than relying only on
+        # default_search for a plain text string.
+        target = f"ytsearch{limit}:{normalized_query}"
+
         with yt_dlp.YoutubeDL(opts) as ydl:
-            results = ydl.extract_info(query, download=False)
-            data = []
-            for e in results.get("entries", []):
-                data.append({
-                    "id": e.get("id"),
-                    "title": e.get("title"),
-                    "duration": e.get("duration"),
-                    "url": f"https://youtube.com/watch?v={e.get('id')}",
-                    "thumbnail": e.get("thumbnail"),
-                    "channel": e.get("channel") or e.get("uploader"),
-                    "views": e.get("view_count"),
-                })
+            results = ydl.extract_info(target, download=False) or {}
+
+        data = []
+        for entry in results.get("entries") or []:
+            if not entry:
+                continue
+
+            video_id = entry.get("id")
+            if not video_id:
+                continue
+
+            data.append({
+                "id": video_id,
+                "title": entry.get("title"),
+                "duration": entry.get("duration"),
+                "url": f"https://youtube.com/watch?v={video_id}",
+                "thumbnail": entry.get("thumbnail"),
+                "channel": entry.get("channel") or entry.get("uploader"),
+                "views": entry.get("view_count"),
+            })
+
+        # IMPORTANT: never cache [].
+        # A temporary YouTube extraction failure must not poison the query for
+        # SEARCH_CACHE_TTL seconds.
+        if data:
             set_cache(cache_key, data)
-            return jsonify({"results": data, "cached": False})
+
+        return jsonify({
+            "results": data,
+            "cached": False,
+        })
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": str(e),
+            "results": [],
+        }), 500
 
 
 @app.route("/reload_cookies")
