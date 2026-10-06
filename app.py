@@ -114,6 +114,8 @@ def index():
         "deno_version": deno_ver,
         "cache_size": len(cache),
         "audio_proxy": True,
+        "audio_mode": "api_bytes_to_bot_local_file",
+        "download_endpoint": "/download/<video_id>",
         "cache_ttl": {
             "song": SONG_CACHE_TTL,
             "search": SEARCH_CACHE_TTL,
@@ -124,11 +126,12 @@ def index():
 
 def _extract_audio_data(video_id, force_fresh=False):
     """
-    Extract one playable audio URL.
+    Extract a stable AUDIO-ONLY stream.
 
-    This helper is shared by /song and /audio. Keeping extraction on the API
-    host avoids giving the bot VPS a raw googlevideo URL that may be tied to
-    the API host/session/IP.
+    Important:
+    - Prefer YouTube m4a/AAC (usually itag 140) for VC compatibility.
+    - Never intentionally fall back to a combined video+audio "best" stream.
+    - webm/opus is used only when no m4a/AAC audio-only stream is available.
     """
     cache_key = f"song:{video_id}"
 
@@ -140,10 +143,14 @@ def _extract_audio_data(video_id, force_fresh=False):
             return cached
 
     url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Keep every choice audio-only. The old code eventually used "best",
+    # which can be a combined A/V format and behaves differently per video.
     format_candidates = [
-        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-        "bestaudio/best",
-        "best",
+        "bestaudio[ext=m4a][acodec^=mp4a]/bestaudio[ext=m4a]",
+        "bestaudio[acodec^=mp4a]/bestaudio[acodec^=aac]",
+        "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]",
+        "bestaudio",
     ]
 
     last_error = None
@@ -156,51 +163,102 @@ def _extract_audio_data(video_id, force_fresh=False):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            stream_url = info.get("url")
             chosen = info
+            stream_url = info.get("url")
 
-            if not stream_url and info.get("requested_formats"):
+            # Some yt-dlp results expose selected formats separately.
+            if (not stream_url or info.get("vcodec") not in (None, "none")) and info.get("requested_formats"):
+                selected_audio = None
                 for fmt in info["requested_formats"]:
-                    if fmt.get("acodec") != "none" and fmt.get("url"):
-                        stream_url = fmt.get("url")
-                        chosen = {**info, **fmt}
+                    if (
+                        fmt.get("url")
+                        and fmt.get("acodec") not in (None, "none")
+                        and fmt.get("vcodec") in (None, "none")
+                    ):
+                        selected_audio = fmt
                         break
 
-            if not stream_url and info.get("formats"):
+                if selected_audio:
+                    chosen = {**info, **selected_audio}
+                    stream_url = selected_audio.get("url")
+
+            # Absolute safety fallback: choose only an audio-only format.
+            if (
+                not stream_url
+                or chosen.get("acodec") in (None, "none")
+                or chosen.get("vcodec") not in (None, "none")
+            ):
                 audio_formats = [
                     fmt
-                    for fmt in info["formats"]
-                    if fmt.get("url")
-                    and fmt.get("acodec") not in (None, "none")
-                ]
-                if audio_formats:
-                    audio_formats.sort(
-                        key=lambda fmt: (
-                            fmt.get("abr") or 0,
-                            fmt.get("tbr") or 0,
-                        ),
-                        reverse=True,
+                    for fmt in (info.get("formats") or [])
+                    if (
+                        fmt.get("url")
+                        and fmt.get("acodec") not in (None, "none")
+                        and fmt.get("vcodec") in (None, "none")
                     )
-                    chosen = {**info, **audio_formats[0]}
-                    stream_url = audio_formats[0].get("url")
+                ]
+
+                # Prefer m4a/AAC first, then highest bitrate audio-only.
+                audio_formats.sort(
+                    key=lambda fmt: (
+                        1 if str(fmt.get("ext") or "").lower() == "m4a" else 0,
+                        1 if str(fmt.get("acodec") or "").lower().startswith(("mp4a", "aac")) else 0,
+                        fmt.get("abr") or 0,
+                        fmt.get("tbr") or 0,
+                    ),
+                    reverse=True,
+                )
+
+                if not audio_formats:
+                    raise RuntimeError("No audio-only format available")
+
+                chosen = {**info, **audio_formats[0]}
+                stream_url = audio_formats[0].get("url")
 
             if not stream_url:
                 raise RuntimeError("No playable audio URL found")
 
+            if chosen.get("acodec") in (None, "none"):
+                raise RuntimeError("Selected format has no audio codec")
+
+            if chosen.get("vcodec") not in (None, "none"):
+                raise RuntimeError("Selected format is not audio-only")
+
+            ext = str(chosen.get("ext") or info.get("ext") or "").lower()
+            acodec = str(chosen.get("acodec") or "")
+            format_id = str(chosen.get("format_id") or "")
+            protocol = str(chosen.get("protocol") or "")
+
             data = {
                 "status": "done",
                 "link": stream_url,
-                "format": chosen.get("ext") or info.get("ext") or "webm",
+                "format": ext,
                 "title": info.get("title"),
                 "duration": info.get("duration"),
                 "thumbnail": info.get("thumbnail"),
                 "channel": info.get("channel") or info.get("uploader"),
                 "selector": selector,
-                # yt-dlp sometimes returns headers that are useful when
-                # requesting the signed media URL.
-                "http_headers": info.get("http_headers") or {},
+                "format_id": format_id,
+                "acodec": acodec,
+                "vcodec": chosen.get("vcodec"),
+                "protocol": protocol,
+                "abr": chosen.get("abr") or chosen.get("tbr"),
+                "http_headers": (
+                    chosen.get("http_headers")
+                    or info.get("http_headers")
+                    or {}
+                ),
                 "cached": False,
             }
+
+            print(
+                "Audio source selected: "
+                f"id={format_id or '?'} "
+                f"ext={ext or '?'} "
+                f"acodec={acodec or '?'} "
+                f"protocol={protocol or '?'}"
+            )
+
             set_cache(cache_key, data)
             return data
 
@@ -278,7 +336,7 @@ def audio_proxy(video_id):
 
         # A cached signed URL can occasionally expire/become invalid.
         # Refresh it once on the API host and retry there.
-        if upstream.status_code == 403:
+        if upstream.status_code in (403, 410):
             upstream.close()
             cache.pop(f"song:{video_id}", None)
             upstream, data = _open_audio_upstream(
@@ -302,6 +360,9 @@ def audio_proxy(video_id):
             ),
             "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
             "Cache-Control": "no-store",
+            "X-Audio-Format": str(data.get("format") or ""),
+            "X-Audio-Codec": str(data.get("acodec") or ""),
+            "X-Audio-Format-Id": str(data.get("format_id") or ""),
         }
 
         for header_name in ("Content-Length", "Content-Range"):
@@ -317,6 +378,124 @@ def audio_proxy(video_id):
         def generate():
             try:
                 for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_with_context(generate()),
+            status=upstream.status_code,
+            headers=response_headers,
+            direct_passthrough=True,
+        )
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
+
+
+@app.route("/download/<video_id>", methods=["GET", "HEAD"])
+@app.route("/download", methods=["GET", "HEAD"])
+def download_audio_bytes(video_id=None):
+    """
+    Direct audio-byte endpoint for the music bot.
+
+    Flow:
+        YouTube -> AWS API -> bot downloads local file -> PyTgCalls local MediaStream
+
+    This deliberately does NOT send a remote media URL to PyTgCalls.
+    It behaves like the old fast /download API that the bot used reliably.
+
+    Range is supported only for retry/resume if the API-to-bot connection drops.
+    """
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    if not video_id:
+        raw = (request.args.get("url") or request.args.get("video_id") or "").strip()
+        if "youtu.be/" in raw:
+            video_id = raw.split("youtu.be/")[-1].split("?")[0]
+        elif "v=" in raw:
+            video_id = raw.split("v=")[-1].split("&")[0]
+        else:
+            video_id = raw
+
+    video_id = (video_id or "").strip()
+    if not video_id:
+        return jsonify({"status": "error", "message": "video_id required"}), 400
+
+    requested_type = (request.args.get("type") or "audio").lower()
+    if requested_type != "audio":
+        return jsonify({
+            "status": "error",
+            "message": "This endpoint currently supports type=audio only",
+        }), 400
+
+    range_header = request.headers.get("Range")
+
+    try:
+        upstream, data = _open_audio_upstream(
+            video_id,
+            range_header=range_header,
+            force_fresh=wants_fresh(),
+        )
+
+        # A short-lived cached YouTube URL can occasionally expire.
+        # Refresh extraction once on AWS and retry there.
+        if upstream.status_code in (403, 410):
+            upstream.close()
+            cache.pop(f"song:{video_id}", None)
+            upstream, data = _open_audio_upstream(
+                video_id,
+                range_header=range_header,
+                force_fresh=True,
+            )
+
+        if upstream.status_code not in (200, 206):
+            status = upstream.status_code
+            upstream.close()
+            return jsonify({
+                "status": "error",
+                "message": f"Upstream media returned {status}",
+            }), status
+
+        ext = str(data.get("format") or "m4a").lower()
+        if ext not in {"m4a", "mp4", "webm", "opus", "ogg", "mp3"}:
+            ext = "m4a"
+
+        response_headers = {
+            "Content-Type": upstream.headers.get(
+                "Content-Type",
+                "audio/mp4" if ext in {"m4a", "mp4"} else "audio/webm",
+            ),
+            "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+            "Cache-Control": "no-store",
+            "X-Audio-Ext": ext,
+            "X-Audio-Codec": str(data.get("acodec") or ""),
+            "X-Audio-Format-Id": str(data.get("format_id") or ""),
+            "X-Video-Id": video_id,
+            "Content-Disposition": f'inline; filename="{video_id}.{ext}"',
+        }
+
+        for header_name in ("Content-Length", "Content-Range"):
+            value = upstream.headers.get(header_name)
+            if value:
+                response_headers[header_name] = value
+
+        if request.method == "HEAD":
+            status = upstream.status_code
+            upstream.close()
+            return Response(status=status, headers=response_headers)
+
+        def generate():
+            try:
+                # Same idea as the old fast direct-download API:
+                # send bytes immediately, no server-side full-file wait.
+                for chunk in upstream.iter_content(chunk_size=128 * 1024):
                     if chunk:
                         yield chunk
             finally:
