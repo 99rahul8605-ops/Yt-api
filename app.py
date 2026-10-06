@@ -1,6 +1,8 @@
 import os
 import time
 import subprocess
+import threading
+import glob
 import requests
 import yt_dlp
 import yt_dlp.version
@@ -19,7 +21,22 @@ SEARCH_CACHE_TTL = max(0, int(os.getenv("SEARCH_CACHE_TTL", "300")))
 VIDEO_CACHE_TTL = max(0, int(os.getenv("VIDEO_CACHE_TTL", "60")))
 DEFAULT_CACHE_TTL = max(0, int(os.getenv("CACHE_TTL", "60")))
 
+# yt-dlp server-side audio cache.
+# HTTP chunking is intentional: it is much more tolerant of YouTube CDN
+# throttling/resets than relaying one long requests.get() connection.
+AUDIO_DL_CACHE_DIR = os.getenv("AUDIO_DL_CACHE_DIR", "/tmp/yt_audio_dl")
+AUDIO_DL_TTL = max(60, int(os.getenv("AUDIO_DL_TTL", "1800")))
+AUDIO_DL_MAX_ITEMS = max(5, int(os.getenv("AUDIO_DL_MAX_ITEMS", "40")))
+AUDIO_HTTP_CHUNK_SIZE = max(
+    256 * 1024,
+    int(os.getenv("AUDIO_HTTP_CHUNK_SIZE", str(1024 * 1024))),
+)
+
+os.makedirs(AUDIO_DL_CACHE_DIR, exist_ok=True)
+
 cache = {}
+_audio_dl_locks = {}
+_audio_dl_locks_guard = threading.Lock()
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 try:
@@ -114,7 +131,8 @@ def index():
         "deno_version": deno_ver,
         "cache_size": len(cache),
         "audio_proxy": True,
-        "audio_mode": "api_bytes_to_bot_local_file",
+        "audio_mode": "ytdlp_chunked_server_download",
+        "audio_http_chunk_size": AUDIO_HTTP_CHUNK_SIZE,
         "download_endpoint": "/download/<video_id>",
         "cache_ttl": {
             "song": SONG_CACHE_TTL,
@@ -295,6 +313,166 @@ def _open_audio_upstream(video_id, range_header=None, force_fresh=False):
     )
     return upstream, data
 
+def _get_audio_dl_lock(video_id):
+    with _audio_dl_locks_guard:
+        lock = _audio_dl_locks.get(video_id)
+        if lock is None:
+            lock = threading.Lock()
+            _audio_dl_locks[video_id] = lock
+        return lock
+
+
+def _find_api_audio_file(video_id):
+    now = time.time()
+    for path in glob.glob(os.path.join(AUDIO_DL_CACHE_DIR, f"{video_id}.*")):
+        if not os.path.isfile(path):
+            continue
+        if path.endswith((".part", ".ytdl")):
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if st.st_size < 16384:
+            continue
+        if now - st.st_mtime <= AUDIO_DL_TTL:
+            return path
+    return None
+
+
+def _cleanup_api_audio_cache():
+    try:
+        now = time.time()
+        files = []
+        for path in glob.glob(os.path.join(AUDIO_DL_CACHE_DIR, "*")):
+            if not os.path.isfile(path) or path.endswith((".part", ".ytdl")):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+
+            if now - st.st_mtime > AUDIO_DL_TTL:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+
+            files.append((st.st_mtime, path))
+
+        files.sort(reverse=True)
+        for _, path in files[AUDIO_DL_MAX_ITEMS:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _download_audio_with_ytdlp(video_id, force_fresh=False):
+    """
+    Download on AWS using yt-dlp's own downloader.
+
+    Unlike the old /download relay, this does not keep one fragile
+    requests.get() connection open to googlevideo. yt-dlp handles:
+      - HTTP chunking
+      - retries
+      - resumed partial downloads
+      - YouTube request headers/cookies/runtime
+    """
+    lock = _get_audio_dl_lock(video_id)
+
+    with lock:
+        if not force_fresh:
+            cached_path = _find_api_audio_file(video_id)
+            if cached_path:
+                os.utime(cached_path, None)
+                return cached_path
+
+        if force_fresh:
+            for old in glob.glob(os.path.join(AUDIO_DL_CACHE_DIR, f"{video_id}.*")):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        outtmpl = os.path.join(AUDIO_DL_CACHE_DIR, f"{video_id}.%(ext)s")
+
+        opts = get_base_opts()
+        opts.update({
+            # Keep the same safe VC preference.
+            "format": (
+                "bestaudio[ext=m4a][acodec^=mp4a]/"
+                "bestaudio[ext=m4a]/"
+                "bestaudio"
+            ),
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "continuedl": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "file_access_retries": 3,
+            "socket_timeout": 20,
+            # This is the key speed/stability change.
+            "http_chunk_size": AUDIO_HTTP_CHUNK_SIZE,
+        })
+
+        started = time.monotonic()
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        path = None
+
+        # Newer yt-dlp often exposes the real downloaded filepath here.
+        for item in info.get("requested_downloads") or []:
+            candidate = item.get("filepath")
+            if candidate and os.path.exists(candidate):
+                path = candidate
+                break
+
+        if not path:
+            candidate = info.get("_filename")
+            if candidate and os.path.exists(candidate):
+                path = candidate
+
+        if not path:
+            candidates = [
+                p for p in glob.glob(
+                    os.path.join(AUDIO_DL_CACHE_DIR, f"{video_id}.*")
+                )
+                if os.path.isfile(p)
+                and not p.endswith((".part", ".ytdl"))
+            ]
+            if candidates:
+                candidates.sort(key=os.path.getmtime, reverse=True)
+                path = candidates[0]
+
+        if not path or not os.path.exists(path):
+            raise RuntimeError("yt-dlp finished but audio file was not found")
+
+        size = os.path.getsize(path)
+        if size < 16384:
+            raise RuntimeError(f"yt-dlp audio file too small: {size} bytes")
+
+        elapsed = max(0.001, time.monotonic() - started)
+        print(
+            f"yt-dlp audio cached: {video_id} "
+            f"{size / 1024 / 1024:.1f} MB in {elapsed:.1f}s "
+            f"({size / 1024 / 1024 / elapsed:.2f} MB/s)"
+        )
+
+        os.utime(path, None)
+        _cleanup_api_audio_cache()
+        return path
+
+
+
 # === AnnieXMusic compatible endpoints ===
 
 @app.route("/song/<video_id>")
@@ -402,15 +580,15 @@ def audio_proxy(video_id):
 @app.route("/download", methods=["GET", "HEAD"])
 def download_audio_bytes(video_id=None):
     """
-    Direct audio-byte endpoint for the music bot.
+    Reliable fast download endpoint.
 
-    Flow:
-        YouTube -> AWS API -> bot downloads local file -> PyTgCalls local MediaStream
+    First request:
+      YouTube -> yt-dlp on AWS (chunked/retried) -> AWS local cache -> bot
 
-    This deliberately does NOT send a remote media URL to PyTgCalls.
-    It behaves like the old fast /download API that the bot used reliably.
+    Retry/resume:
+      bot sends Range -> Flask serves the same AWS local file
 
-    Range is supported only for retry/resume if the API-to-bot connection drops.
+    PyTgCalls still receives only the bot's finished local file.
     """
     if not check_auth():
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
@@ -428,85 +606,25 @@ def download_audio_bytes(video_id=None):
     if not video_id:
         return jsonify({"status": "error", "message": "video_id required"}), 400
 
-    requested_type = (request.args.get("type") or "audio").lower()
-    if requested_type != "audio":
-        return jsonify({
-            "status": "error",
-            "message": "This endpoint currently supports type=audio only",
-        }), 400
-
-    range_header = request.headers.get("Range")
-
     try:
-        upstream, data = _open_audio_upstream(
+        path = _download_audio_with_ytdlp(
             video_id,
-            range_header=range_header,
             force_fresh=wants_fresh(),
         )
 
-        # A short-lived cached YouTube URL can occasionally expire.
-        # Refresh extraction once on AWS and retry there.
-        if upstream.status_code in (403, 410):
-            upstream.close()
-            cache.pop(f"song:{video_id}", None)
-            upstream, data = _open_audio_upstream(
-                video_id,
-                range_header=range_header,
-                force_fresh=True,
-            )
+        ext = Path(path).suffix.lower().lstrip(".") or "m4a"
 
-        if upstream.status_code not in (200, 206):
-            status = upstream.status_code
-            upstream.close()
-            return jsonify({
-                "status": "error",
-                "message": f"Upstream media returned {status}",
-            }), status
-
-        ext = str(data.get("format") or "m4a").lower()
-        if ext not in {"m4a", "mp4", "webm", "opus", "ogg", "mp3"}:
-            ext = "m4a"
-
-        response_headers = {
-            "Content-Type": upstream.headers.get(
-                "Content-Type",
-                "audio/mp4" if ext in {"m4a", "mp4"} else "audio/webm",
-            ),
-            "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
-            "Cache-Control": "no-store",
-            "X-Audio-Ext": ext,
-            "X-Audio-Codec": str(data.get("acodec") or ""),
-            "X-Audio-Format-Id": str(data.get("format_id") or ""),
-            "X-Video-Id": video_id,
-            "Content-Disposition": f'inline; filename="{video_id}.{ext}"',
-        }
-
-        for header_name in ("Content-Length", "Content-Range"):
-            value = upstream.headers.get(header_name)
-            if value:
-                response_headers[header_name] = value
-
-        if request.method == "HEAD":
-            status = upstream.status_code
-            upstream.close()
-            return Response(status=status, headers=response_headers)
-
-        def generate():
-            try:
-                # Same idea as the old fast direct-download API:
-                # send bytes immediately, no server-side full-file wait.
-                for chunk in upstream.iter_content(chunk_size=128 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
-                upstream.close()
-
-        return Response(
-            stream_with_context(generate()),
-            status=upstream.status_code,
-            headers=response_headers,
-            direct_passthrough=True,
+        response = send_file(
+            path,
+            conditional=True,
+            as_attachment=False,
+            max_age=0,
         )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Accept-Ranges"] = "bytes"
+        response.headers["X-Audio-Ext"] = ext
+        response.headers["X-Video-Id"] = video_id
+        return response
 
     except Exception as e:
         return jsonify({
