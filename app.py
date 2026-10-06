@@ -7,7 +7,7 @@ import glob
 import requests
 import yt_dlp
 import yt_dlp.version
-from flask import Flask, jsonify, request, Response, stream_with_context
+from flask import Flask, jsonify, request, Response, stream_with_context, send_file
 
 app = Flask(__name__)
 
